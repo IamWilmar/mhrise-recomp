@@ -9822,7 +9822,7 @@ void Executor::save_recent_pipelines() {
         if (!ok) {
             unlink(tmp.c_str());
             static std::atomic<int> logged{0};
-            if (nvn::first_times(logged, 3)) NVN_LOG("precalentado: no se pudo escribir %s\n", path.c_str());
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 3) NVN_LOG("precalentado: no se pudo escribir %s\n", path.c_str());
         }
         recent_writing_.store(false, std::memory_order_relaxed);
     }).detach();
