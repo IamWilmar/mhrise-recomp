@@ -12,12 +12,13 @@ own ARM64 code runs directly on the device's CPU, while this project reimplement
 
 ## Status
 
-**Release 1.6.0 — playable.** Kamura village and hunts run at a locked 30 fps: when a scene gets too heavy the
+**Release 1.7.0 — playable.** Kamura village and hunts run at a locked 30 fps: when a scene gets too heavy the
 port lowers the game's internal resolution for a moment (dynamic resolution) instead of dropping frames. Upscaled to
 1080p with AMD FSR 1. Sunbreak and the other DLC load if you provide them.
 
 - **Type your own names.** Naming your hunter, Palico or Palamute opens Android's keyboard: ✓ or OK accepts, Back
   cancels.
+- **Endemic life is visible.** Small creatures (Stinkmink, Clothfly and the rest) now show up in the field.
 - First visits to new areas can hitch while shaders are compiled; it gets smoother as the shader cache fills up.
 - Known issues: occasional speckles on the first loading screen after choosing a save; some effects may look wrong.
 
@@ -105,6 +106,7 @@ at start-up.
 | `lsfg/` | Frame generation (Lossless Scaling's LSFG) to show ~60 fps. Needs **your own** `Lossless.dll` from the Windows app *Lossless Scaling* (sold on Steam), copied into that `lsfg` folder or to `Download/Lossless.dll`. Not included here. |
 | `60fps` | Unlocks 60 fps mode (the Flip 2 GPU reaches ~45 in the village, less in hunts). |
 | `sin_teclado` | Names are not typed: the game gets "Flip" (or the lines of a `nombre.txt` file in the game folder). |
+| `sin_devolver_copias` | The game's GPU visibility results are not copied back for the CPU (as before 1.7.0: endemic life is not drawn). |
 | `sin_fps` | Hides the FPS counter (the same switch as in the settings panel). |
 | `sin_avisos_version` | Turns the update notices off: no request to GitHub (the same switch as in the settings panel). |
 | `con_barras_sistema` | Keeps Android's navigation and status bars on screen. By default the app hides them while the game runs (swipe in from an edge to bring them up for a moment). Read when the game window gets focus. |

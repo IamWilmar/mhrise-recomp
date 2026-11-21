@@ -1066,6 +1066,7 @@ public:
         const uint8_t* data;
         uint64_t generation;  // la del overlay al grabar la copia
         uint8_t writers;
+        bool whole = false;  // Overlay::cpu_reads: la copia de la GPU es todo el overlay, así que va entera (sin mezcla a tres)
     };
     std::mutex wb_mutex_;
     std::vector<PendingWriteBack> pending_wb_;
@@ -1861,6 +1862,7 @@ private:
         // Su hueco en la arena (sin el desfase de la dirección): al tirarlo vuelve a overlay_free_ (ver make_overlay).
         VkDeviceSize slot_offset = 0, slot_size = 0;
         uint8_t* slot_data = nullptr;
+        bool cpu_reads = false;  // destino de una copia de la GPU que el juego lee en la CPU (copy_from_overlay)
         bool merged = false;  // hecho por merge_overlays (une rangos: que la CPU lo tire es lo que la unión puede empeorar)
         // <datos>/vigilar_overlays: sus páginas vigiladas (nnsdk/watch.h); overlay_unchanged mira si alguna se escribió
         // antes de pasar a la huella.
@@ -2079,6 +2081,12 @@ private:
     bool recycle_overlays_ = true;  // interruptor sin_huecos_overlays (read_flags)
     bool patch_overlays_ = true;    // interruptor sin_parchear_overlays (read_flags; ver overlay_containing)
     bool write_back_on_ = false;    // con_devolver (read_flags): sin él no hace falta la referencia de cada overlay
+    // Sin con_devolver, aun así vuelven a la memoria del juego los destinos de las copias de la GPU desde lo que esta
+    // escribió (Overlay::cpu_reads): así lee el juego sus resultados. La prueba de oclusión de MH Rise escribe desde un
+    // pixel shader qué objetos vio, copia eso con un CopyBuffer a otro buffer y lo mira en la CPU el frame siguiente; sin
+    // devolverlo la CPU veía ceros y la fauna endémica y los cordópteros no se dibujaban (se podían recoger igual).
+    // <datos>/sin_devolver_copias: como antes.
+    bool readback_copies_ = true, any_cpu_reads_ = false;
     // Perfil: bytes de overlays nuevos (de la arena) y en huecos reutilizados; compactaciones y lo que costaron.
     uint64_t prof_overlay_new_bytes_ = 0, prof_overlay_reused_bytes_ = 0;
     uint64_t prof_compactions_ = 0, prof_compact_wait_us_ = 0, prof_compact_copy_us_ = 0;
@@ -2579,7 +2587,7 @@ void Executor::finish(bool wait) {
     if (!recording_) return;
     end_render_pass();
     flush_clears(nullptr);  // borrados diferidos: presentar (otro command buffer) o la CPU pueden leer la textura
-    readback_pending_ = NVN_FLAG("con_devolver");  // las copias de lectura de este envío, al principio del siguiente
+    readback_pending_ = NVN_FLAG("con_devolver") || any_cpu_reads_;  // las copias de lectura de este envío, al principio del siguiente
     vkEndCommandBuffer(cmd_);
     InFlight& f = inflight_[cur_];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -3168,6 +3176,20 @@ void Executor::deliver_write_backs(uint64_t up_to) {
         if (st->second.generation != w.generation) continue;  // de antes de que la CPU lo reescribiera
         WriteBackState& ws = st->second;
         auto* game = reinterpret_cast<uint8_t*>(w.address);
+        // Un buffer que el juego rellena con una copia de la GPU para leerlo: quiere la copia, haga lo que haga la CPU
+        // con él desde entonces (MH Rise reescribe en la CPU sus resultados de oclusión después de leerlos; con la
+        // mezcla a tres la mayoría de lo de la GPU se quedaba fuera y la fauna parpadeaba).
+        if (w.whole) {
+            nnsdk::watch::before_kernel_write(game, w.size);
+            memcpy(game, w.data, w.size);
+            memcpy(ws.base.data(), w.data, w.size);
+            if (ws.watched) nnsdk::watch::collect(w.address, w.size, ws.keys, nullptr);
+            prof_written_back_ += w.size;
+            auto& pd = prof_delivered_[w.address];
+            pd.first = w.size, pd.second += w.size;
+            delivered_hash_[w.address] = range_hash(game, w.size);
+            continue;
+        }
         bool opened = false, cpu_rewrote = false;
         std::vector<std::pair<size_t, size_t>> cpu_runs;  // tramos de páginas que escribió la CPU desde base
         if (ws.watched) nnsdk::watch::collect(w.address, w.size, ws.keys, &cpu_runs);
@@ -3274,6 +3296,7 @@ bool Executor::record_overlay_readbacks() {
     for (auto& [address, o] : overlays_) {
         // Escrito desde la última copia (que se grabó al empezar el envío readback_submit: lo de ese envío va después).
         if (!o.written || o.written < o.readback_submit || o.size > kWriteBackMax) continue;
+        if (!write_back_on_ && !o.cpu_reads) continue;  // (sin con_devolver, solo lo que el juego copia para leer)
         if (o.readback && busy_readbacks_.count(o.readback_data)) continue;  // la anterior aún sin entregar
         if (!o.readback) {
             const int other = 1 - readback_cur_;
@@ -3301,7 +3324,8 @@ bool Executor::record_overlay_readbacks() {
         busy_readbacks_[o.readback_data] = o.readback_arena;
         readback_busy_[o.readback_arena]++;
         const auto st = wb_state_.find(address);
-        pending_wb_.push_back({current, address, o.size, o.readback_data, st != wb_state_.end() ? st->second.generation : 0, o.writers});
+        pending_wb_.push_back({current, address, o.size, o.readback_data, st != wb_state_.end() ? st->second.generation : 0, o.writers,
+                               o.cpu_reads && !write_back_on_});
     }
     return barrier_done;
 }
@@ -3432,6 +3456,7 @@ void Executor::read_flags() {
     watch_overlays_ = NVN_FLAG("vigilar_overlays");
     memo_pipeline_ = !NVN_FLAG("sin_memo_pipeline");
     fast_bindless_ = !NVN_FLAG("sin_bindless_rapido");
+    readback_copies_ = !NVN_FLAG("sin_devolver_copias");
     const bool write_back = NVN_FLAG("con_devolver");
     if (write_back && !write_back_on_) {
         // Se enciende en vivo: los overlays de antes no tienen referencia (make_overlay solo la hace con la devolución) y
@@ -7675,6 +7700,25 @@ bool Executor::copy_from_overlay(uint64_t src, uint64_t dst, uint64_t size) {
     if (auto it = overlays_.upper_bound(dst);
         keep_gpu_overlays_ && it != overlays_.begin() && dst < std::prev(it)->first + std::prev(it)->second.size)
         std::prev(it)->second.writers |= kWrittenByCopy;
+    // Copia para que el juego la lea en la CPU (readback_copies_): vuelve a su memoria cuando termine este envío.
+    if (readback_copies_ && !write_back_on_)
+        if (auto it = overlays_.upper_bound(dst); it != overlays_.begin()) {
+            --it;
+            Overlay& o = it->second;
+            if (dst < it->first + o.size && o.size <= kWriteBackMax) {
+                std::lock_guard lock(wb_mutex_);
+                if (!wb_state_.count(it->first)) {
+                    wb_reference(it->first, o.size);
+                    static int logged = 0;
+                    if (logged++ < 8)
+                        NVN_LOG("copia para leer en la CPU: %#llx+%llu vuelve a la memoria del juego\n",
+                                static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(o.size));
+                }
+                o.cpu_reads = true;
+                o.written = submitted_.load(std::memory_order_relaxed) + 1;
+                any_cpu_reads_ = true;
+            }
+        }
     return true;
 }
 
